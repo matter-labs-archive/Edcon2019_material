@@ -9,6 +9,7 @@ use ff::{
     PrimeField,
     PrimeFieldRepr,
     Field,
+    BitIterator
 };
 
 use pairing::{
@@ -33,6 +34,7 @@ use sapling_crypto::circuit::{
 use sapling_crypto::jubjub::{
     JubjubEngine,
     FixedGenerators,
+    PrimeOrder,
     Unknown,
     edwards,
     JubjubParams
@@ -47,8 +49,9 @@ pub struct AccountWitness {
 
 #[derive(Clone)]
 pub struct UTXOWitness<E: JubjubEngine> {
-    pub value: Option<E::Fs>,
-    pub blinding: Option<E::Fs>,
+    pub value: Option<E::Fr>,
+    pub blinding: Option<E::Fr>,
+    // pub commitment: Option<edwards::Point<E, PrimeOrder>>
 }
 
 pub struct ConfidentialAccount<'a, E: JubjubEngine> {
@@ -180,6 +183,85 @@ impl<'a, E: JubjubEngine> Circuit<E> for ConfidentialAccount<'a, E> {
             |_| packed_hash_lc.lc(E::Fr::one())
         );
 
+        // if time permits we can now also make an UTXO design
+
+        let utxo_value = num::AllocatedNum::alloc(
+            cs.namespace(|| "utxo value"),
+            || {
+                let value = self.utxo.value;
+                Ok(*value.get()?)
+            }
+        )?;
+
+        utxo_value.limit_number_of_bits(
+            cs.namespace(|| "limit number of bits for value"),
+            NUM_VALUE_BITS
+        )?;
+
+        let utxo_bits = utxo_value.into_bits_le(
+            cs.namespace(|| "get utxo value bits")
+        )?;
+
+        let utxo_blinding = num::AllocatedNum::alloc(
+            cs.namespace(|| "utxo blinding"),
+            || {
+                let value = self.utxo.blinding;
+                Ok(*value.get()?)
+            }
+        )?;
+
+        let blinding_bits = utxo_blinding.into_bits_le(
+            cs.namespace(|| "get blinding bits")
+        )?;
+
+
+        let value_point = ecc::fixed_base_multiplication(
+            cs.namespace(|| "value * G"), 
+            FixedGenerators::ValueCommitmentValue, 
+            &utxo_bits, 
+            self.params
+        )?;
+
+        let blinding_point = ecc::fixed_base_multiplication(
+            cs.namespace(|| "blinding * H"), 
+            FixedGenerators::ValueCommitmentRandomness, 
+            &blinding_bits, 
+            self.params
+        )?;
+
+        let commitment_point = value_point.add(
+            cs.namespace(|| "calculate commitment"),
+            &blinding_point, 
+            self.params
+        )?;
+
+        commitment_point.inputize(
+            cs.namespace(|| "make commitment as input")
+        )?;
+
+        // let supplied_commitment = ecc::EdwardsPoint::witness(
+        //     cs.namespace(|| "externally supplied commitment"),
+        //     self.utxo.commitment,
+        //     self.params
+        // )?;
+
+        let remaining_value = num::AllocatedNum::alloc(
+            cs.namespace(|| "remaining_value"), 
+            || {
+                let mut v1 = *value.get_value().get()?;
+                let v2 = *utxo_value.get_value().get()?;
+
+                v1.sub_assign(&v2);
+
+                Ok(v1)
+            }
+        )?;
+
+        remaining_value.limit_number_of_bits(
+            cs.namespace(|| "limit number of bits in remaining value"),
+            NUM_VALUE_BITS
+        )?;
+
         Ok(())
     }
 }
@@ -221,6 +303,34 @@ fn u128_into_be_bits(value: u128) -> Vec<bool>
     bits
 }
 
+pub fn le_bit_vector_into_field_element<P: PrimeField>
+    (bits: &Vec<bool>) -> P
+{
+    // double and add
+    let mut fe = P::zero();
+    let mut base = P::one();
+
+    for bit in bits {
+        if *bit {
+            fe.add_assign(&base);
+        }
+        base.double();
+    }
+
+    fe
+}
+
+pub fn encode_fs_into_fr<E: JubjubEngine>(input: E::Fs)
+    -> E::Fr 
+{
+    let mut fs_le_bits: Vec<bool> = BitIterator::new(input.into_repr()).collect();
+    fs_le_bits.reverse();
+
+    let converted = le_bit_vector_into_field_element::<E::Fr>(&fs_le_bits);
+
+    converted
+}
+
 
 #[test]
 fn test_the_circuit() {
@@ -236,10 +346,24 @@ fn test_the_circuit() {
 
     let mut rng = XorShiftRng::from_seed([0x3dbe6258, 0x8d313d76, 0x3237db17, 0xe5bc0654]);
 
-    let (public_input, circuit) = {
+    let (public_inputs, circuit) = {
         let value: u64 = rng.gen(); // Rand is not implemented for u128, so we can away with it
         let value = value as u128;
         let value_bits = u128_into_be_bits(value);
+
+        let utxo_value = value / 100;
+        let utxo_value = fs::Fs::from_str(&utxo_value.to_string()).expect("must make utxo value");
+        let blinding: fs::Fs = rng.gen();
+
+        let value_generator = params.generator(FixedGenerators::ValueCommitmentValue);
+        let blinding_generator = params.generator(FixedGenerators::ValueCommitmentRandomness);
+
+        let commitment = value_generator.mul(utxo_value, &params)
+            .add(&blinding_generator.mul(blinding, &params), 
+            &params
+        );
+
+        let (x,y) = commitment.into_xy();
 
         let old_blinding_bits: Vec<bool> = (0..NUM_BLINDING_BITS).map(|_| rng.gen()).collect();
 
@@ -272,8 +396,9 @@ fn test_the_circuit() {
         let current_account_state = Fr::from_repr(repr).expect("must be a valud representation");
 
         let utxo = UTXOWitness::<Bn256> {
-            value: None,
-            blinding: None,
+            value: Some(encode_fs_into_fr::<Bn256>(utxo_value)),
+            blinding: Some(encode_fs_into_fr::<Bn256>(blinding)),
+            // commitment: None
         };
 
         let circuit = ConfidentialAccount::<Bn256> {
@@ -283,7 +408,7 @@ fn test_the_circuit() {
             utxo: utxo,
         };
 
-        (current_account_state, circuit)
+        (vec![current_account_state, x, y], circuit)
     };
 
     // TestConstraintSystem is a special constraint system implementation that does not reduce R1CS
@@ -338,8 +463,8 @@ fn test_the_circuit() {
         create_random_proof(circuit, &parameters, &mut rng).expect("must create a proof")
     };
 
-    let is_valid = verify_proof(&prepared_vk, &proof, &vec![public_input]).expect("must verify a proof");
+    let is_valid = verify_proof(&prepared_vk, &proof, &public_inputs).expect("must verify a proof");
 
-    assert!(is_valid);
+    assert!(is_valid, "proof was invalid");
     println!("Test is complete");
 }
