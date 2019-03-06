@@ -1,18 +1,16 @@
-extern crate ff;
-extern crate pairing;
 extern crate bellman;
 extern crate sapling_crypto;
 extern crate crypto;
 extern crate rand;
 
-use ff::{
+use bellman::pairing::ff::{
     PrimeField,
     PrimeFieldRepr,
     Field,
     BitIterator
 };
 
-use pairing::{
+use bellman::pairing::{
     Engine
 };
 

@@ -1,18 +1,16 @@
-extern crate ff;
-extern crate pairing;
 extern crate bellman;
 extern crate sapling_crypto;
 extern crate crypto;
 extern crate rand;
 
-use ff::{
+use bellman::pairing::ff::{
     PrimeField,
     PrimeFieldRepr,
     Field,
     BitIterator
 };
 
-use pairing::{
+use bellman::pairing::{
     Engine
 };
 
@@ -341,7 +339,7 @@ pub fn encode_fs_into_fr<E: JubjubEngine>(input: E::Fs)
 
 #[test]
 fn test_the_circuit() {
-    use pairing::bn256::*;
+    use bellman::pairing::bn256::*;
     use rand::{SeedableRng, Rng, XorShiftRng, Rand};
     use sapling_crypto::circuit::test::*;
     use sapling_crypto::alt_babyjubjub::{AltJubjubBn256, fs, edwards, PrimeOrder};
